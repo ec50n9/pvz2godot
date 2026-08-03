@@ -2,16 +2,32 @@
 """
 pvz2godot.py — 将植物大战僵尸的 .reanim.compiled 动画转换为 Godot 4 场景 (.tscn)
 
-原理参考:
-  - 二进制解码: librePvZ/reanim-decode (Ruifeng Xie, Rust)
-    https://github.com/librePvZ/librePvZ
-  - Godot 动画转换: HYTommm/PVZ_reanim2godot_animation (C)
-    https://github.com/HYTommm/PVZ_reanim2godot_animation
+二进制格式与求值语义依据对 toolvs.com/pvz-reanim (浏览器端解析器) 的逆向:
+
+  外层: i32 LE 魔数 -559022380 (0xDEADFED4, 字节 d4 fe ad de) + 4 字节,
+        其后全部为 zlib (deflate) 压缩数据
+  内层: 8 字节头, i32 轨道数, f32 fps, 4 字节填充, i32 标记 0xC,
+        轨道表 轨道数×(8 字节填充 + i32 帧数),
+        每轨道: 长度前缀 UTF-8 字符串名 + i32 标记 0x2C,
+               帧数 × (7×f32 {x,y,kx,ky,sx,sy,f,a} + 12 字节填充),
+               帧数 × 3 个长度前缀字符串 {image, font, text}
+  缺失标记: 字段值 ≈ -10000 (|v + 10000| < 0.001) 表示该帧未定义此字段
+  求值: 逐帧继承 —— 缺失字段沿用上一帧的值, 初始状态
+        f=0, x=0, y=0, kx=0, ky=0, sx=1, sy=1, a=1, 无 image/font/text
+
+Godot 映射 (与 PVZ 渲染矩阵精确等价):
+  PVZ 每帧矩阵:   x轴基 = (sx·cos kx°, sx·sin kx°)
+                  y轴基 = (−sy·sin ky°, sy·cos ky°), 平移 (x, y)
+  Godot Node2D:   x轴基 = (cos r·sx, sin r·sx)
+                  y轴基 = (−sin(r+sk)·sy, cos(r+sk)·sy), 平移 position
+  对比可得: rotation = radians(kx), skew = radians(ky − kx),
+            scale = (sx, sy), position = (x, y)
+  rotation / skew 沿时间轴做 ±π 连续化 (unwrap), 保证 Godot 线性插值走最短弧。
 
 仅依赖 Python 标准库。
 
 用法:
-  python3 pvz2godot.py <输入文件或目录> --images <贴图目录> --out <输出目录>
+  python3 pvz2godot.py <输入文件或目录> --images <贴图目录>... --out <输出目录>
       [--res-prefix res://pvz] [--no-loop]
 
 输出:
@@ -31,26 +47,28 @@ import zlib
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
-# 二进制解码 (对应 librePvZ reanim-decode 的 stream.rs / reanim.rs)
+# 二进制解码 (对齐 toolvs 参考实现)
 # ---------------------------------------------------------------------------
 
-ZLIB_MAGIC = b"\xd4\xfe\xad\xde"
-REANIM_MAGIC = 0xB393B4C0
-HEADER_END_MAGIC = 0x0C
-TRACK_MAGIC = 0x2C
-ABSENT_SENTINEL = -10000.0  # f32 <= 此值表示字段缺失
+ZLIB_HEADER_MAGIC = -559022380  # i32 LE, 即 0xDEADFED4
+HEADER_END_MARKER = 0x0C
+TRACK_MARKER = 0x2C
+ABSENT_VALUE = -10000.0
+ABSENT_EPS = 1e-3
+
+NUMERIC_FIELDS = ("x", "y", "kx", "ky", "sx", "sy", "f", "a")
 
 
 @dataclass
 class Frame:
     x: float | None = None
     y: float | None = None
-    kx: float | None = None  # 旋转角(度)
-    ky: float | None = None  # y轴角(度), skew = ky - kx
+    kx: float | None = None
+    ky: float | None = None
     sx: float | None = None
     sy: float | None = None
-    f: float | None = None   # 可见性: >=0 显示, -1 隐藏
-    a: float | None = None   # 透明度
+    f: float | None = None
+    a: float | None = None
     image: str | None = None
     font: str | None = None
     text: str | None = None
@@ -69,6 +87,8 @@ class Reanim:
 
 
 class Reader:
+    """小端二进制读取器: i32/f32 + int32 长度前缀 UTF-8 字符串 (去尾部 NUL)"""
+
     def __init__(self, data: bytes):
         self.data = data
         self.pos = 0
@@ -80,57 +100,60 @@ class Reader:
         self.pos += n
         return chunk
 
-    def u32(self) -> int:
-        return struct.unpack("<I", self.take(4))[0]
+    def i32(self) -> int:
+        return struct.unpack("<i", self.take(4))[0]
 
     def f32(self) -> float:
         return struct.unpack("<f", self.take(4))[0]
 
     def opt_f32(self) -> float | None:
         v = self.f32()
-        return None if v <= ABSENT_SENTINEL else v
+        # 参考实现: |v - (-10000)| < 0.001 视为缺失 (而非 v <= -10000,
+        # 避免把合法的屏外大负坐标误判为缺失)
+        return None if abs(v - ABSENT_VALUE) < ABSENT_EPS else v
 
     def string(self) -> str:
-        n = self.u32()
-        return self.take(n).decode("utf-8", errors="replace") if n else ""
+        n = self.i32()
+        if n <= 0:
+            return ""
+        return self.take(n).decode("utf-8", errors="replace").rstrip("\x00")
 
     def skip(self, n: int) -> None:
         self.take(n)
 
-    def check_magic(self, expected: int) -> None:
-        got = self.u32()
-        if got != expected:
-            raise ValueError(f"magic mismatch: expect {expected:#x}, got {got:#x} @ {self.pos - 8}")
 
-
-def decode_compiled(data: bytes) -> Reanim:
-    """解码 .reanim.compiled (支持可选的 zlib 外层)"""
-    if data[:4] == ZLIB_MAGIC:
+def decode_compiled(data: bytes, warn=print) -> Reanim:
+    """解码 .reanim.compiled (外层可选 zlib 包装)"""
+    if len(data) < 8:
+        raise ValueError("文件太小, 不是有效的 .reanim.compiled")
+    if struct.unpack_from("<i", data, 0)[0] == ZLIB_HEADER_MAGIC:
         data = zlib.decompress(data[8:])
+
     r = Reader(data)
-    r.check_magic(REANIM_MAGIC)
-    r.skip(4)  # padding after-magic
-    track_count = r.u32()
+    r.skip(8)  # 内层 8 字节头 (含魔数, 参考实现直接跳过)
+    track_count = r.i32()
     fps = r.f32()
-    r.skip(4)  # padding "prop"
-    r.check_magic(HEADER_END_MAGIC)
+    r.skip(4)
+    marker = r.i32()
+    if marker != HEADER_END_MARKER:
+        warn(f"警告: 头部结束标记应为 {HEADER_END_MARKER:#x}, 实际 {marker:#x}, 继续尝试")
+
     frame_counts = []
     for _ in range(track_count):
-        r.skip(8)  # padding "frame"
-        frame_counts.append(r.u32())
+        r.skip(8)
+        frame_counts.append(r.i32())
+
     tracks = []
-    for n in frame_counts:
+    for ti, count in enumerate(frame_counts):
         name = r.string()
-        r.check_magic(TRACK_MAGIC)
+        marker = r.i32()
+        if marker != TRACK_MARKER:
+            warn(f"警告: 轨道 {ti} 标记应为 {TRACK_MARKER:#x}, 实际 {marker:#x}, 继续尝试")
         frames = []
-        for _ in range(n):
-            frames.append(Frame(
-                x=r.opt_f32(), y=r.opt_f32(),
-                kx=r.opt_f32(), ky=r.opt_f32(),
-                sx=r.opt_f32(), sy=r.opt_f32(),
-                f=r.opt_f32(), a=r.opt_f32(),
-            ))
-            r.skip(12)  # padding "transform"
+        for _ in range(count):
+            values = [r.opt_f32() for _ in NUMERIC_FIELDS]
+            r.skip(12)
+            frames.append(Frame(**dict(zip(NUMERIC_FIELDS, values))))
         for fr in frames:
             image, font, text = r.string(), r.string(), r.string()
             fr.image = image or None
@@ -141,82 +164,102 @@ def decode_compiled(data: bytes) -> Reanim:
 
 
 # ---------------------------------------------------------------------------
-# 语义累积 (对应 HYTommm 的 inherit 帧模式)
+# 逐帧求值 (对齐参考实现: 继承语义 + 固定初始状态)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class State:
+    """一个部件在某一帧的完整求值结果"""
+    x: float = 0.0
+    y: float = 0.0
+    kx: float = 0.0
+    ky: float = 0.0
+    sx: float = 1.0
+    sy: float = 1.0
+    f: float = 0.0
+    a: float = 1.0
+    image: str | None = None
+    font: str | None = None
+    text: str | None = None
+
+    @property
+    def visible(self) -> bool:
+        return self.f >= 0.0
+
+
+def resolve_states(track: Track) -> list[State]:
+    """缺失字段继承上一帧 (与参考实现的 J/B 函数一致)"""
+    states = []
+    cur = State()
+    for fr in track.frames:
+        for key in NUMERIC_FIELDS:
+            v = getattr(fr, key)
+            if v is not None:
+                setattr(cur, key, v)
+        if fr.image is not None:
+            cur.image = fr.image
+        if fr.font is not None:
+            cur.font = fr.font
+        if fr.text is not None:
+            cur.text = fr.text
+        states.append(State(**vars(cur)))
+    return states
+
+
+# ---------------------------------------------------------------------------
+# 角度处理与 Godot 属性序列
 # ---------------------------------------------------------------------------
 
 PI = math.pi
+TAU = 2.0 * math.pi
 
 
-def wrap_near(value: float, reference: float) -> float:
-    """把角度值回绕到 reference 的 ±π 区间内 (对应 C 代码的 SetKx/SetKy)"""
-    while value - reference > PI:
-        value -= 2 * PI
-    while value - reference < -PI:
-        value += 2 * PI
-    return value
+def unwrap_angles(seq: list[float]) -> list[float]:
+    """numpy 风格 unwrap: 相邻值差限制在 ±π, 保留长期旋转趋势"""
+    if not seq:
+        return []
+    out = [seq[0]]
+    for v in seq[1:]:
+        prev = out[-1]
+        out.append(prev + (v - prev + PI) % TAU - PI)
+    return out
 
 
 @dataclass
-class PartState:
-    """一个部件(轨道)随帧推进的累积状态"""
-    x: float = 0.0
-    y: float = 0.0
-    sx: float = 1.0
-    sy: float = 1.0
-    rot: float = 0.0   # 弧度
-    skew: float = 0.0  # 弧度
-    alpha: float = 1.0
-    visible: bool = True
-    image: str | None = None
-    blend_add: bool = False
-
-    def apply(self, fr: Frame) -> dict[str, bool]:
-        """应用一帧, 返回各离散属性是否变化"""
-        changed = {"visible": False, "image": False, "blend": False}
-        if fr.x is not None:
-            self.x = fr.x
-        if fr.y is not None:
-            self.y = fr.y
-        if fr.sx is not None:
-            self.sx = fr.sx
-        if fr.sy is not None:
-            self.sy = fr.sy
-        if fr.kx is not None:
-            new_rot = wrap_near(math.radians(fr.kx), self.rot)
-            self.skew += self.rot - new_rot
-            self.rot = new_rot
-        if fr.ky is not None:
-            self.skew = wrap_near(math.radians(fr.ky % 360.0) - self.rot, self.skew)
-        if fr.a is not None:
-            self.alpha = fr.a
-        if fr.f is not None:
-            new_vis = fr.f >= 0.0
-            changed["visible"] = new_vis != self.visible
-            self.visible = new_vis
-        if fr.image is not None:
-            changed["image"] = True
-            self.image = fr.image
-        if fr.text or fr.font:
-            # 文字元素暂不支持, 忽略
-            pass
-        return changed
+class PartTimeline:
+    """一个部件整条时间轴上的 Godot 属性 (角度已 unwrap)"""
+    name: str
+    states: list[State]
+    rotation: list[float]  # 弧度
+    skew: list[float]      # 弧度
 
 
-def image_to_filename(image: str) -> str:
-    """IMAGE_REANIM_ZOMBIE_BODY -> Zombie_body.png (与 C 代码一致: 首字母保留, 其余小写)"""
-    prefix = "IMAGE_REANIM_"
-    if image.startswith(prefix) and len(image) > len(prefix):
-        rest = image[len(prefix):]
-        return rest[0] + rest[1:].lower() + ".png"
-    return image
+def build_part_timeline(name: str, track: Track) -> PartTimeline:
+    states = resolve_states(track)
+    rot = unwrap_angles([math.radians(s.kx) for s in states])
+    skew = unwrap_angles([math.radians(s.ky - s.kx) for s in states])
+    return PartTimeline(name=name, states=states, rotation=rot, skew=skew)
+
+
+# ---------------------------------------------------------------------------
+# 贴图名解析 (对齐参考实现的 IMAGE_* 规则)
+# ---------------------------------------------------------------------------
+
+def image_basename(image: str) -> str:
+    """IMAGE_REANIM_ZOMBIE_BODY -> zombie_body.png (全小写, 与参考实现一致)"""
+    name = image.strip()
+    upper = name.upper()
+    if upper.startswith("IMAGE_REANIM_"):
+        name = name[len("IMAGE_REANIM_"):]
+    elif upper.startswith("IMAGE_"):
+        name = name[len("IMAGE_"):]
+    return name.lower() + ".png"
 
 
 def sanitize_node_name(name: str, used: set[str]) -> str:
-    """首字母大写, '.' 替换为 '_', 重名加数字后缀 (与 C 代码一致)"""
     if not name:
         name = "part"
-    name = name[0].upper() + name[1:]
-    name = name.replace(".", "_")
+    name = name[0].upper() + name[1:].replace(".", "_")
     candidate, i = name, 0
     while candidate in used:
         i += 1
@@ -232,7 +275,7 @@ class Segment:
     end: int  # 含
 
 
-def find_segments(track: Track) -> Segment | None:
+def find_segment(track: Track) -> Segment | None:
     """anim_* 轨道是子动画段落标记: f==0 处开始, f==-1 前一帧结束"""
     if not track.name.startswith("anim_"):
         return None
@@ -271,69 +314,71 @@ def vec2(x: float, y: float) -> str:
 class BuiltAnimation:
     name: str
     length: float
-    # 每条 Godot 轨道: (path, interp, update, times, values已格式化为tscn文本)
-    tracks: list[tuple[str, int, int, list[float], list[str]]] = field(default_factory=list)
+    # (NodePath 属性, update 模式, times, 已格式化 values)
+    tracks: list[tuple[str, int, list[float], list[str]]] = field(default_factory=list)
+
+
+UPDATE_CONTINUOUS = 0
+UPDATE_DISCRETE = 1
 
 
 def build_animation(
     name: str,
-    parts: list[tuple[str, Track]],  # (节点名, 轨道)
+    parts: list[PartTimeline],
     fps: float,
     start: int,
     end: int,
-    texture_ids: dict[str, str],     # 贴图文件名 -> ext_resource id
-    loop: bool,
+    texture_ids: dict[str, str],
 ) -> BuiltAnimation:
     anim = BuiltAnimation(name=name, length=(end - start + 1) / fps)
-    for node, track in parts:
-        state = PartState()
-        # 先快进到段落起点, 得到初始状态
-        for fr in track.frames[:start]:
-            state.apply(fr)
+    for part in parts:
+        node = part.name
+        n = len(part.states)
+        if n == 0:
+            continue
+        last = min(end, n - 1)
+        if start > last:
+            continue
 
-        times: dict[str, list[float]] = {k: [] for k in
-            ("pos", "rot", "scale", "skew", "alpha", "vis", "tex", "mat")}
+        times: dict[str, list[float]] = {k: [] for k in ("pos", "rot", "scale", "skew", "alpha")}
         values: dict[str, list[str]] = {k: [] for k in times}
+        vis_times: list[float] = []
+        vis_values: list[str] = []
+        tex_times: list[float] = []
+        tex_values: list[str] = []
+        prev_visible: bool | None = None
+        prev_image: str | None = None
 
-        def push_dense(t: float) -> None:
-            times["pos"].append(t); values["pos"].append(vec2(state.x, state.y))
-            times["rot"].append(t); values["rot"].append(fnum(state.rot))
-            times["scale"].append(t); values["scale"].append(vec2(state.sx, state.sy))
-            times["skew"].append(t); values["skew"].append(fnum(state.skew))
-            times["alpha"].append(t)
-            values["alpha"].append(f"Color(1, 1, 1, {fnum(state.alpha)})")
-
-        has_tex_key = False
-        has_mat_key = False
-        for idx in range(start, min(end + 1, len(track.frames))):
+        for idx in range(start, last + 1):
             t = (idx - start) / fps
-            fr = track.frames[idx]
-            changed = state.apply(fr)
-            push_dense(t)
-            if fr.f is not None:
-                times["vis"].append(t)
-                values["vis"].append("true" if state.visible else "false")
-            if changed["image"] and state.image:
-                fn = image_to_filename(state.image)
-                if fn in texture_ids:
-                    has_tex_key = True
-                    times["tex"].append(t)
-                    values["tex"].append(f'ExtResource("{texture_ids[fn]}")')
-        if times["vis"] and (end - start) / fps not in times["vis"]:
-            pass  # 离散轨道无需收尾
+            s = part.states[idx]
+            times["pos"].append(t); values["pos"].append(vec2(s.x, s.y))
+            times["rot"].append(t); values["rot"].append(fnum(part.rotation[idx]))
+            times["scale"].append(t); values["scale"].append(vec2(s.sx, s.sy))
+            times["skew"].append(t); values["skew"].append(fnum(part.skew[idx]))
+            times["alpha"].append(t); values["alpha"].append(f"Color(1, 1, 1, {fnum(s.a)})")
+            if s.visible != prev_visible:
+                prev_visible = s.visible
+                vis_times.append(t)
+                vis_values.append("true" if s.visible else "false")
+            if s.image != prev_image:
+                prev_image = s.image
+                fn = image_basename(s.image) if s.image else None
+                if fn and fn in texture_ids:
+                    tex_times.append(t)
+                    tex_values.append(f'ExtResource("{texture_ids[fn]}")')
 
-        node_tracks: list[tuple[str, int, int, list[float], list[str]]] = [
-            (f"{node}:position", 1, 0, times["pos"], values["pos"]),
-            (f"{node}:rotation", 1, 0, times["rot"], values["rot"]),
-            (f"{node}:scale", 1, 0, times["scale"], values["scale"]),
-            (f"{node}:skew", 1, 0, times["skew"], values["skew"]),
-            (f"{node}:self_modulate", 1, 0, times["alpha"], values["alpha"]),
-        ]
-        if times["vis"]:
-            node_tracks.append((f"{node}:visible", 1, 1, times["vis"], values["vis"]))
-        if has_tex_key:
-            node_tracks.append((f"{node}:texture", 1, 1, times["tex"], values["tex"]))
-        anim.tracks.extend(node_tracks)
+        anim.tracks.extend([
+            (f"{node}:position", UPDATE_CONTINUOUS, times["pos"], values["pos"]),
+            (f"{node}:rotation", UPDATE_CONTINUOUS, times["rot"], values["rot"]),
+            (f"{node}:scale", UPDATE_CONTINUOUS, times["scale"], values["scale"]),
+            (f"{node}:skew", UPDATE_CONTINUOUS, times["skew"], values["skew"]),
+            (f"{node}:self_modulate", UPDATE_CONTINUOUS, times["alpha"], values["alpha"]),
+        ])
+        if vis_times:
+            anim.tracks.append((f"{node}:visible", UPDATE_DISCRETE, vis_times, vis_values))
+        if tex_times:
+            anim.tracks.append((f"{node}:texture", UPDATE_DISCRETE, tex_times, tex_values))
     return anim
 
 
@@ -343,12 +388,12 @@ def emit_animation_subres(res_id: str, anim: BuiltAnimation, loop: bool) -> str:
     lines.append(f"length = {fnum(anim.length)}")
     if loop:
         lines.append("loop_mode = 1")
-    for i, (path, interp, update, times, vals) in enumerate(anim.tracks):
+    for i, (path, update, times, vals) in enumerate(anim.tracks):
         lines.append(f'tracks/{i}/type = "value"')
         lines.append(f"tracks/{i}/imported = false")
         lines.append(f"tracks/{i}/enabled = true")
         lines.append(f'tracks/{i}/path = NodePath("{path}")')
-        lines.append(f"tracks/{i}/interp = {interp}")
+        lines.append(f"tracks/{i}/interp = 1")
         lines.append(f"tracks/{i}/loop_wrap = true")
         times_s = ", ".join(fnum(t) for t in times)
         trans_s = ", ".join("1" for _ in times)
@@ -366,10 +411,8 @@ def convert(
     reanim: Reanim,
     scene_name: str,
     res_prefix: str,
-    image_lookup: dict[str, str],  # 小写文件名 -> 实际文件名
-    out_dir: str,
+    image_lookup: dict[str, tuple[str, str]],
     tex_out_dir: str,
-    images_dir: str,
     loop: bool,
 ) -> tuple[str, list[str]]:
     """返回 (tscn 文本, 警告列表)"""
@@ -377,33 +420,35 @@ def convert(
 
     # 分离段落轨道与部件轨道
     segments: list[Segment] = []
-    parts: list[tuple[str, Track]] = []
+    part_tracks: list[Track] = []
     used_names: set[str] = set()
     for tr in reanim.tracks:
-        seg = find_segments(tr)
+        seg = find_segment(tr)
         if seg is not None:
             segments.append(seg)
         else:
-            parts.append((sanitize_node_name(tr.name, used_names), tr))
+            part_tracks.append(tr)
 
-    max_frames = max((len(tr.frames) for tr in reanim.tracks), default=1)
+    parts = [build_part_timeline(sanitize_node_name(tr.name, used_names), tr)
+             for tr in part_tracks]
+    max_frames = max((len(tr.frames) for tr in part_tracks), default=1)
 
-    # 收集用到的贴图, 建立 ext_resource
+    # 收集用到的贴图 (按求值后的 image 序列)
     tex_files: list[str] = []
     seen: set[str] = set()
-    for _, tr in parts:
-        for fr in tr.frames:
-            if fr.image:
-                fn = image_to_filename(fr.image)
+    for part in parts:
+        for s in part.states:
+            if s.image:
+                fn = image_basename(s.image)
                 if fn not in seen:
                     seen.add(fn)
                     tex_files.append(fn)
-    texture_ids = {fn: f"{i + 1}" for i, fn in enumerate(tex_files)}
+    texture_ids = {fn: str(i + 1) for i, fn in enumerate(tex_files)}
 
-    # 复制贴图 (大小写不敏感查找)
+    # 复制贴图
     os.makedirs(tex_out_dir, exist_ok=True)
     for fn in tex_files:
-        hit = image_lookup.get(fn.lower())
+        hit = image_lookup.get(fn)
         if hit is None:
             warnings.append(f"贴图缺失: {fn}")
             continue
@@ -412,29 +457,22 @@ def convert(
         if not os.path.exists(dst):
             shutil.copy2(os.path.join(src_dir, actual), dst)
 
-    # 各部件首帧状态 (用于节点默认值, 让场景在编辑器里直接拼好)
-    initial: dict[str, PartState] = {}
-    for node, tr in parts:
-        st = PartState()
-        if tr.frames:
-            st.apply(tr.frames[0])
-        initial[node] = st
+    if any(s.text for part in parts for s in part.states):
+        warnings.append("包含 text 轨道, 文字元素暂不支持, 已忽略")
 
     # 构建动画: "all" + 各段落
-    anims: list[BuiltAnimation] = [
-        build_animation("all", parts, reanim.fps, 0, max_frames - 1, texture_ids, loop)
-    ]
+    anims = [build_animation("all", parts, reanim.fps, 0, max_frames - 1, texture_ids)]
     for seg in segments:
-        anims.append(build_animation(seg.name, parts, reanim.fps, seg.start, seg.end, texture_ids, loop))
+        anims.append(build_animation(seg.name, parts, reanim.fps, seg.start, seg.end, texture_ids))
 
     # ---- 生成 tscn ----
     ext_count = len(tex_files)
     sub_count = len(anims) + 1  # animations + 1 library
     load_steps = 1 + ext_count + sub_count
 
-    out: list[str] = [f'[gd_scene load_steps={load_steps} format=3]', ""]
+    out: list[str] = [f"[gd_scene load_steps={load_steps} format=3]", ""]
     for fn in tex_files:
-        hit = image_lookup.get(fn.lower())
+        hit = image_lookup.get(fn)
         actual = hit[1] if hit else fn
         out.append(f'[ext_resource type="Texture2D" path="{res_prefix}/textures/{actual}" id="{texture_ids[fn]}"]')
     out.append("")
@@ -454,21 +492,25 @@ def convert(
 
     out.append(f'[node name="{scene_name}" type="Node2D"]')
     out.append("")
-    for node, _tr in parts:
-        st = initial[node]
-        out.append(f'[node name="{node}" type="Sprite2D" parent="."]')
-        if st.x or st.y:
-            out.append(f"position = {vec2(st.x, st.y)}")
-        if st.rot:
-            out.append(f"rotation = {fnum(st.rot)}")
-        if st.sx != 1.0 or st.sy != 1.0:
-            out.append(f"scale = {vec2(st.sx, st.sy)}")
-        if st.skew:
-            out.append(f"skew = {fnum(st.skew)}")
-        if not st.visible:
+    for part in parts:
+        if not part.states:
+            continue
+        s = part.states[0]
+        out.append(f'[node name="{part.name}" type="Sprite2D" parent="."]')
+        if s.x or s.y:
+            out.append(f"position = {vec2(s.x, s.y)}")
+        if part.rotation[0]:
+            out.append(f"rotation = {fnum(part.rotation[0])}")
+        if s.sx != 1.0 or s.sy != 1.0:
+            out.append(f"scale = {vec2(s.sx, s.sy)}")
+        if part.skew[0]:
+            out.append(f"skew = {fnum(part.skew[0])}")
+        if s.a != 1.0:
+            out.append(f"self_modulate = Color(1, 1, 1, {fnum(s.a)})")
+        if not s.visible:
             out.append("visible = false")
-        if st.image:
-            fn = image_to_filename(st.image)
+        if s.image:
+            fn = image_basename(s.image)
             if fn in texture_ids:
                 out.append(f'texture = ExtResource("{texture_ids[fn]}")')
         out.append("")
@@ -484,29 +526,35 @@ def convert(
 # CLI
 # ---------------------------------------------------------------------------
 
-def build_image_lookup(images_dir: str) -> dict[str, str]:
-    lookup = {}
-    for fn in os.listdir(images_dir):
-        if fn.lower().endswith((".png", ".jpg", ".gif")):
-            lookup[fn.lower()] = (images_dir, fn)
+def build_image_lookup(images_dirs: list[str]) -> dict[str, tuple[str, str]]:
+    """递归遍历贴图目录: 小写 basename -> (所在目录, 实际文件名)"""
+    lookup: dict[str, tuple[str, str]] = {}
+    for root_dir in images_dirs:
+        for dirpath, _dirs, files in os.walk(root_dir):
+            for fn in files:
+                if fn.lower().endswith((".png", ".jpg", ".gif", ".tga")):
+                    lookup.setdefault(fn.lower(), (dirpath, fn))
     return lookup
 
 
-def process_file(path: str, args, image_lookup: dict[str, str]) -> tuple[bool, list[str]]:
+def process_file(path: str, args, image_lookup: dict[str, tuple[str, str]]) -> tuple[bool, list[str]]:
     name = os.path.basename(path)
     for suffix in (".reanim.compiled", ".xml.compiled", ".compiled"):
         if name.endswith(suffix):
             name = name[: -len(suffix)]
             break
+    warnings: list[str] = []
     try:
-        reanim = decode_compiled(open(path, "rb").read())
+        data = open(path, "rb").read()
+        reanim = decode_compiled(data, warn=lambda m: warnings.append(f"{name}: {m}"))
     except Exception as e:  # noqa: BLE001
         return False, [f"{os.path.basename(path)}: 解码失败: {e}"]
-    tscn, warnings = convert(
+    tscn, conv_warnings = convert(
         reanim, name, args.res_prefix, image_lookup,
-        args.out, os.path.join(args.out, "textures"), args.images,
+        os.path.join(args.out, "textures"),
         loop=not args.no_loop,
     )
+    warnings.extend(conv_warnings)
     out_path = os.path.join(args.out, f"{name}.tscn")
     with open(out_path, "w", encoding="utf-8") as fp:
         fp.write(tscn)
@@ -517,7 +565,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="PVZ reanim.compiled -> Godot 4 tscn 转换器")
     ap.add_argument("input", help=".reanim.compiled 文件或包含它们的目录")
     ap.add_argument("--images", required=True, nargs="+",
-                    help="贴图 PNG 目录, 可多个 (如 pvz_assets/reanim pvz_assets/images)")
+                    help="贴图目录, 可多个, 递归查找 (如 pvz_assets/reanim pvz_assets/images)")
     ap.add_argument("--out", required=True, help="输出目录 (建议指向 Godot 项目内)")
     ap.add_argument("--res-prefix", default="res://pvz",
                     help="tscn 中引用贴图的 res:// 前缀 (默认 res://pvz)")
@@ -525,9 +573,7 @@ def main() -> int:
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    image_lookup = {}
-    for d in args.images:
-        image_lookup.update(build_image_lookup(d))
+    image_lookup = build_image_lookup(args.images)
 
     if os.path.isdir(args.input):
         files = [os.path.join(args.input, f) for f in sorted(os.listdir(args.input))

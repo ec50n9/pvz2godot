@@ -77,12 +77,12 @@ python3 pvz2godot.py pvz_assets/compiled/reanim \
 | reanim 字段 | Godot 轨道 | 说明 |
 |---|---|---|
 | `x` / `y` | `position` | 连续轨道 |
-| `kx` | `rotation` | 度→弧度，±π 回绕保持连续 |
-| `ky` | `skew` | `skew = ky - kx` |
+| `kx` | `rotation` | 度→弧度，沿时间轴 ±π 连续化 (unwrap) |
+| `ky` | `skew` | `skew = ky - kx`，同样 unwrap |
 | `sx` / `sy` | `scale` | 连续轨道 |
 | `a` | `self_modulate` | `Color(1,1,1,a)` |
 | `f` | `visible` | 离散轨道，`>=0` 显示，`-1` 隐藏 |
-| `i` | `texture` | 离散轨道，`IMAGE_REANIM_XXX` → `Xxx.png` |
+| `i` | `texture` | 离散轨道，`IMAGE_REANIM_XXX` → `xxx.png`（全小写） |
 
 ### 粒子特效 / 拖尾 → Godot 场景
 
@@ -178,7 +178,7 @@ tracks            track_count × {
                     string name            (u32 长度 + UTF-8)
                     u32 magic = 0x2C
                     frame_count × Transform {
-                      8 × optional f32     (x y kx ky sx sy f a，值 <= -10000 表示缺失)
+                      8 × optional f32     (x y kx ky sx sy f a，值 ≈ -10000 (容差 0.001) 表示缺失)
                       12 字节填充
                     }
                     frame_count × Elements {
@@ -190,7 +190,7 @@ tracks            track_count × {
 语义规则：
 
 - 帧中缺失的字段继承上一帧的值（初始：`pos=(0,0)`、`scale=(1,1)`、`rot/skew=0`、`alpha=1`、可见）
-- `kx` 为旋转角（度），`ky` 为 y 轴角度（度），`rotation = kx`、`skew = ky - kx`，均需做 ±π 回绕
+- `kx` 为旋转角（度），`ky` 为 y 轴角度（度）。PVZ 矩阵 x轴基=`(sx·cos kx, sx·sin kx)`、y轴基=`(−sy·sin ky, sy·cos ky)`，与 Godot `Transform2D(rot, scale, skew, pos)` 对比可得 `rotation = kx`、`skew = ky − kx`（精确等价），两者沿时间轴做 ±π 连续化 (unwrap)，保证线性插值走最短弧
 - 名为 `anim_*` 的轨道不是精灵部件，而是子动画段落标记：`f=0` 为起点、`f=-1` 前一帧为终点
 
 ### 粒子 .xml.compiled（PvZ PC 版粒子）
@@ -270,8 +270,9 @@ Define OffsetList ( (ox, oy), … );                 # 每个字符的绘制偏�
 
 本项目为独立重实现，格式与转换思路参考了以下开源项目：
 
+- [toolvs.com/pvz-reanim](https://toolvs.com/pvz-reanim)（浏览器端解析器，已逆向）— `.reanim.compiled` 解码与求值语义的权威参照：外层魔数 `0xDEADFED4` + zlib 外层、缺失哨兵 `-10000 ± 0.001`、逐帧继承求值、PVZ 矩阵公式
 - [librePvZ/librePvZ](https://github.com/librePvZ/librePvZ)（Rust, AGPL-3.0）— `.reanim.compiled` 二进制解码
-- [HYTommm/PVZ_reanim2godot_animation](https://github.com/HYTommm/PVZ_reanim2godot_animation)（C, GPL-3.0）— reanim → Godot 动画的转换逻辑
+- [HYTommm/PVZ_reanim2godot_animation](https://github.com/HYTommm/PVZ_reanim2godot_animation)（C, GPL-3.0）— reanim → Godot 动画的转换思路（其增量式 skew 状态机已被弃用，改为与 Godot `Transform2D(rot, scale, skew, pos)` 精确等价的直接映射 + 时间轴 unwrap）
 - [YingFengTingYu/PopStudio](https://github.com/YingFengTingYu/PopStudio)（C#）— 粒子/拖尾 compiled 二进制布局
 - [InLiothixi/stabledecompile](https://github.com/InLiothixi/stabledecompile)（PvZ 反编译）— 粒子字段语义、默认值与枚举
 - [un4seen BASS](https://www.un4seen.com/) — MO3 解码（通过官方动态库）
