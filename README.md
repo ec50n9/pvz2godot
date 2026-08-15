@@ -98,19 +98,20 @@ python3 particles2godot.py pvz_assets/compiled/particles \
 |---|---|---|
 | `SpawnMaxActive` / `SpawnRate` | `amount` | MaxActive 缺失时用 速率×寿命估算 |
 | `ParticleDuration` | `lifetime` | 单位 1/100 秒 → 秒 |
-| `SystemDuration`+循环标志 | `one_shot` | |
-| `EmitterType` + Radius/Box | `emission_shape` | 圆/盒/环 |
-| `LaunchAngle` | `direction` + `spread` | 弧度→度（均为 y 向下坐标系） |
-| `LaunchSpeed` | `initial_velocity` | px/s |
-| `Field`(加速度/摩擦) | `gravity` / `damping` | |
-| `ParticleRed/Green/Blue/Alpha` | `color_ramp` | × System 颜色，GradientTexture1D |
+| `SystemDuration`+循环标志 | `one_shot` + `explosiveness` | 一次性系统发射期 = 系统时长 |
+| `EmitterType` + Radius/Box | `emission_shape` | 圆盘/圆周/盒；半径恒定用 ring |
+| `LaunchAngle` | `direction` + `spread` | 单位**度**，**0 = 竖直向下、顺时针** → direction=(sinθ, cosθ)；轨道恒零（含未定义）时全向随机 spread=180 |
+| `LaunchSpeed` | `initial_velocity` | 原版每 tick 位移 = 值×0.01 px（100 tick/s），**数值上即 px/s** |
+| `Field`(加速度) | `gravity` | v += 0.01·x 每 tick → ×100 = px/s² |
+| `Field`(摩擦) | `damping` | 原版 v ×= (1-x) 每 tick（指数衰减）；Godot 阻尼为线性，取初始斜率匹配近似 |
+| `ParticleRed/Green/Blue/Alpha` + `Brightness` | `color_ramp` | × System 颜色 × 亮度，GradientTexture1D，节点间线性插值采样 |
 | `ParticleScale` | `scale_amount_curve` | CurveTexture |
-| `ParticleSpinAngle/Speed` | `initial_rotation` / `angular_velocity` | |
+| `ParticleSpinAngle/Speed` | `initial_rotation` / `angular_velocity` | 单位**度 / 度每秒**，与轨道值直接对应（spin_speed 每 tick 增量 = 值×0.01 度） |
 | `ImageCol/Row` > 1 | `CanvasItemMaterial` 翻页动画 | h/v frames |
 | `PARTICLE_ADDITIVE` | `blend_mode = add` | |
 | `PARTICLE_DONT_FOLLOW` | `local_coords = false` | |
 
-未映射：stretch、clip、emitter_path、碰撞等（转换时会给出警告，数据保留在 JSON 里）。
+未映射：stretch、clip、emitter_path、碰撞、CrossFade/OnDuration、多帧贴图的随机静态帧（退化为随寿命播放）等（转换时会给出警告，数据保留在 JSON 里）。
 
 ## 字体
 

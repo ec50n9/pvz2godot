@@ -221,6 +221,23 @@ def node_value(node: dict) -> float:
     return (node["low"] + node["high"]) / 2.0
 
 
+def eval_track(nodes: list[dict], t: float, interp: float = 0.5) -> float:
+    """FloatTrackEvaluate 的确定性近似（Definition.cpp）：
+    端点钳制 + 节点间线性插值（CurveType 缓动的近似）+ 节点内 [low,high] 按 interp 定位。"""
+    if not nodes:
+        return 0.0
+    nodes = sorted(nodes, key=lambda n: n["time"])
+    vals = [n["low"] + (n["high"] - n["low"]) * interp for n in nodes]
+    if t <= nodes[0]["time"]:
+        return vals[0]
+    for (a, va), (b, vb) in zip(zip(nodes, vals), zip(nodes[1:], vals[1:])):
+        if t <= b["time"]:
+            span = b["time"] - a["time"]
+            f = 0.0 if span <= 0 else (t - a["time"]) / span
+            return va + (vb - va) * f
+    return vals[-1]
+
+
 def track_nodes(e: dict, name: str) -> list[dict]:
     t = e["tracks"].get(name)
     if t:
@@ -288,16 +305,6 @@ def sanitize(name: str, used: set[str]) -> str:
     return cand
 
 
-def color(e: dict, base: str, t: float = 0.0) -> tuple[float, float, float, float]:
-    """particle 颜色轨道 × system 颜色, 取离 t 最近的节点"""
-    def pick(track: str) -> float:
-        nodes = track_nodes(e, track)
-        node = min(nodes, key=lambda n: abs(n["time"] - t))
-        return node_value(node)
-    r = pick(f"particle_{base}") * avg0(e, f"system_{base}") if base != "brightness" else 1.0
-    return r
-
-
 def build_emitter_tscn(
     e: dict,
     node_name: str,
@@ -317,77 +324,114 @@ def build_emitter_tscn(
     if dur_s <= 0:
         dur_s = 1.0
 
-    # 发射形状
+    # 发射形状（原版 CIRCLE：发射点 = 半径×发射角方向，半径在轨道 [low,high] 内随机）
     etype = e["emitter_type"]
-    radius = avg0(e, "emitter_radius")
-    if etype == EMITTER_CIRCLE and radius > 0:
-        pm.append("emission_shape = 1")
-        pm.append(f"emission_sphere_radius = {fnum(radius)}")
-    elif etype in (EMITTER_CIRCLE_PATH, EMITTER_CIRCLE_EVEN_SPACING) and radius > 0:
+    r_lo, r_hi = t0(e, "emitter_radius")
+    box_cx = box_cy = 0.0
+    if etype == EMITTER_CIRCLE and r_hi > 0:
+        if r_hi - r_lo < 0.5:
+            # 半径恒定 → 圆周发射（ring）
+            pm.append("emission_shape = 6")
+            pm.append(f"emission_ring_radius = {fnum(r_hi)}")
+            pm.append(f"emission_ring_inner_radius = {fnum(r_hi)}")
+        else:
+            # 半径随机 → 圆盘发射（半径均匀随机，与原版一致）
+            pm.append("emission_shape = 1")
+            pm.append(f"emission_sphere_radius = {fnum(r_hi)}")
+    elif etype in (EMITTER_CIRCLE_PATH, EMITTER_CIRCLE_EVEN_SPACING) and r_hi > 0:
         pm.append("emission_shape = 6")
-        pm.append(f"emission_ring_radius = {fnum(radius)}")
-        pm.append(f"emission_ring_inner_radius = {fnum(radius)}")
+        pm.append(f"emission_ring_radius = {fnum(r_hi)}")
+        pm.append(f"emission_ring_inner_radius = {fnum(r_hi)}")
     elif etype in (EMITTER_BOX, EMITTER_BOX_PATH):
-        bx, by = avg0(e, "emitter_box_x"), avg0(e, "emitter_box_y")
-        if bx > 0 or by > 0:
+        # 原版 box_x/box_y 轨道 [low,high] 是发射点坐标范围，中心在 (hi+lo)/2
+        bx_lo, bx_hi = t0(e, "emitter_box_x")
+        by_lo, by_hi = t0(e, "emitter_box_y")
+        ex, ey = (bx_hi - bx_lo) / 2.0, (by_hi - by_lo) / 2.0
+        if ex > 0 or ey > 0:
             pm.append("emission_shape = 3")
-            pm.append(f"emission_box_extents = Vector3({fnum(bx)}, {fnum(by)}, 1)")
+            pm.append(f"emission_box_extents = Vector3({fnum(ex)}, {fnum(ey)}, 1)")
+        box_cx, box_cy = (bx_hi + bx_lo) / 2.0, (by_hi + by_lo) / 2.0
 
-    # 发射方向与速度
-    ang_lo, ang_hi = t0(e, "launch_angle")
-    if ang_hi - ang_lo >= math.tau - 0.01:
-        pm.append("spread = 180")
+    # 发射方向与速度。原版语义（TodParticle.cpp ParticleSpawn）：
+    #   launch_angle 单位为度，0 = 竖直向下(+y)，顺时针为正；velocity = (sinθ, cosθ)×speed
+    #   launch_angle 轨道恒零（含未定义）时取 [0, 2π) 全随机方向
+    #   launch_speed 每 tick 位移 = track×0.01 px（100 tick/s）→ 数值上 track 即 px/s
+    ang_lo, ang_hi = t0(e, "launch_angle")  # 度
+    if (ang_hi - ang_lo) >= 360.0 - 0.01 or (ang_lo == 0.0 and ang_hi == 0.0):
+        pm.append("spread = 180")  # 全向随机
     else:
-        mid = (ang_lo + ang_hi) / 2.0
-        pm.append(f"direction = Vector3({fnum(math.cos(mid))}, {fnum(math.sin(mid))}, 0)")
-        pm.append(f"spread = {fnum(min(180.0, math.degrees((ang_hi - ang_lo) / 2.0)))}")
-    spd_lo, spd_hi = t0(e, "launch_speed")
+        mid = math.radians((ang_lo + ang_hi) / 2.0)
+        pm.append(f"direction = Vector3({fnum(math.sin(mid))}, {fnum(math.cos(mid))}, 0)")
+        pm.append(f"spread = {fnum(min(180.0, (ang_hi - ang_lo) / 2.0))}")
+    spd_lo, spd_hi = t0(e, "launch_speed")  # px/s（见上方注释，track 数值即 px/s）
     pm.append(f"initial_velocity_min = {fnum(spd_lo)}")
     pm.append(f"initial_velocity_max = {fnum(max(spd_lo, spd_hi))}")
 
-    # 场: 加速度 -> 重力, 摩擦 -> 阻尼
+    # 场（TodParticle.cpp UpdateParticleField）：
+    #   加速度场: v += 0.01·x 每 tick（v 单位 px/tick）→ a = 100x px/s²
+    #   摩擦场:   v ×= (1-x) 每 tick → 指数衰减，衰减率 k = -100·ln(1-x) /s
+    gravity = None
     for fld in e["fields"] + e["system_fields"]:
-        if fld["type"] == FIELD_ACCELERATION and fld["x"] and fld["y"]:
-            gx = node_value(fld["x"][0]) * 100.0  # 1/100s² -> px/s²
-            gy = node_value(fld["y"][0]) * 100.0
+        if fld["type"] == FIELD_ACCELERATION and (fld["x"] or fld["y"]):
+            # 单轴轨道可缺失（缺失轴 = 0），取首节点近似（原版随粒子时间插值）
+            gx = node_value(fld["x"][0]) * 100.0 if fld["x"] else 0.0
+            gy = node_value(fld["y"][0]) * 100.0 if fld["y"] else 0.0
+            gravity = (gx, gy)
             pm.append(f"gravity = Vector3({fnum(gx)}, {fnum(gy)}, 0)")
-        elif fld["type"] == FIELD_FRICTION and fld["x"]:
-            damp = node_value(fld["x"][0]) * 100.0
-            pm.append(f"damping_min = {fnum(damp)}")
-            pm.append(f"damping_max = {fnum(damp)}")
+    for fld in e["fields"] + e["system_fields"]:
+        if fld["type"] == FIELD_FRICTION and (fld["x"] or fld["y"]):
+            x = node_value((fld["x"] or fld["y"])[0])
+            if x > 0:
+                # Godot 阻尼是线性减速（px/s²），无法精确表达指数衰减；
+                # 取 t=0 时刻斜率匹配：damping = k × v_典型
+                k = -100.0 * math.log(max(1e-6, 1.0 - x))
+                v_typ = max(abs(spd_lo), abs(spd_hi))
+                if v_typ < 1e-3 and gravity:
+                    v_typ = math.hypot(*gravity) * dur_s / 2.0
+                damp = k * v_typ
+                pm.append(f"damping_min = {fnum(damp)}")
+                pm.append(f"damping_max = {fnum(damp)}")
 
-    # 旋转
+    # 旋转。原版语义（TodParticle.cpp Update）：
+    #   spin_angle 轨道单位为度（初始角）；
+    #   spin_speed 每 tick 增量 DEG_TO_RAD(track×0.01) → 角速度 = track 度/秒，
+    #   与 Godot initial_rotation/angular_velocity 的单位（度、度/秒）直接对应
     if flags & FLAG_RANDOM_LAUNCH_SPIN:
         pm.append("initial_rotation_min = -180")
         pm.append("initial_rotation_max = 180")
     else:
         sa_lo, sa_hi = t0(e, "particle_spin_angle")
-        pm.append(f"initial_rotation_min = {fnum(math.degrees(sa_lo))}")
-        pm.append(f"initial_rotation_max = {fnum(math.degrees(sa_hi))}")
+        pm.append(f"initial_rotation_min = {fnum(sa_lo)}")
+        pm.append(f"initial_rotation_max = {fnum(sa_hi)}")
     ss_lo, ss_hi = t0(e, "particle_spin_speed")
-    pm.append(f"angular_velocity_min = {fnum(math.degrees(ss_lo))}")
-    pm.append(f"angular_velocity_max = {fnum(math.degrees(ss_hi))}")
+    pm.append(f"angular_velocity_min = {fnum(ss_lo)}")
+    pm.append(f"angular_velocity_max = {fnum(ss_hi)}")
     if flags & FLAG_ALIGN_LAUNCH_SPIN:
         pm.append("particle_flag_align_y = true")
 
-    # 颜色渐变 (particle 生命周期内)
+    # 颜色渐变（particle 生命周期内）。原版渲染语义（TodParticle.cpp）：
+    #   实际颜色 = 粒子轨道(随寿命插值) × 系统轨道(系统时间，近似取 t=0) × 亮度
+    #   亮度 = particle_brightness × system_brightness（旧版漏乘，颜色整体偏暗）
     ramp_id = sub_ids.get("ramp")
     if ramp_id:
         pm.append(f'color_ramp = SubResource("{ramp_id}")')
-        grad_points = []
-        nodes = sorted(track_nodes(e, "particle_alpha"), key=lambda n: n["time"])
-        times = sorted({max(0.0, min(1.0, n["time"])) for n in nodes} | {0.0, 1.0})
-        offsets, colors = [], []
+        ptracks = {b: track_nodes(e, f"particle_{b}")
+                   for b in ("red", "green", "blue", "alpha", "brightness")}
+        # 采样点 = 各轨道节点时间并集 + 首尾（节点间线性插值，缓动的近似）
+        times = sorted({max(0.0, min(1.0, n["time"])) for ns in ptracks.values() for n in ns}
+                       | {0.0, 1.0})
+        sys_rgb = [avg0(e, f"system_{b}") for b in ("red", "green", "blue")]
+        sys_a = avg0(e, "system_alpha")
+        sys_b = avg0(e, "system_brightness")
+        colors = []
         for t in times:
-            def ch(base: str) -> float:
-                ns = track_nodes(e, f"particle_{base}")
-                n = min(ns, key=lambda x: abs(x["time"] - t))
-                sys_v = avg0(e, f"system_{base}")
-                return node_value(n) * sys_v
-            offsets.append(t)
-            colors.append((ch("red"), ch("green"), ch("blue"), ch("alpha")))
+            bright = eval_track(ptracks["brightness"], t) * sys_b
+            rgb = [max(0.0, eval_track(ptracks[base], t) * sv * bright)
+                   for base, sv in zip(("red", "green", "blue"), sys_rgb)]
+            a = max(0.0, min(1.0, eval_track(ptracks["alpha"], t) * sys_a))
+            colors.append((*rgb, a))
         grad = ['[sub_resource type="Gradient" id="Gradient_1"]']
-        grad.append("offsets = PackedFloat32Array(" + ", ".join(fnum(o) for o in offsets) + ")")
+        grad.append("offsets = PackedFloat32Array(" + ", ".join(fnum(o) for o in times) + ")")
         grad.append("colors = PackedColorArray(" + ", ".join(
             fnum(c) for rgba in colors for c in rgba) + ")")
         subs["Gradient_1"] = "\n".join(grad)
@@ -399,10 +443,15 @@ def build_emitter_tscn(
     if curve_id:
         pm.append(f'scale_amount_curve = SubResource("{curve_id}")')
         nodes = sorted(track_nodes(e, "particle_scale"), key=lambda n: n["time"])
-        pts = ", ".join(f"Vector2({fnum(max(0.0, min(1.0, n['time'])))}, {fnum(node_value(n))}), 0.0, 0.0, 0, 0"
-                        for n in nodes)
+        pts, last_t = [], None
+        for n in nodes:  # 钳制后去重（重复时间点的 Curve 非法）
+            t = max(0.0, min(1.0, n["time"]))
+            if t == last_t:
+                continue
+            last_t = t
+            pts.append(f"Vector2({fnum(t)}, {fnum(node_value(n))}), 0.0, 0.0, 0, 0")
         subs["Curve_1"] = ('[sub_resource type="Curve" id="Curve_1"]\n'
-                           f"_data = [{pts}]")
+                           f"_data = [{', '.join(pts)}]")
         subs[curve_id] = ('[sub_resource type="CurveTexture" id="%s"]\n'
                           'curve = SubResource("Curve_1")') % curve_id
 
@@ -411,22 +460,32 @@ def build_emitter_tscn(
                    + "\n".join(pm))
 
     # ---- GPUParticles2D 节点 ----
+    # spawn_rate 单位：个/秒（原版 mSpawnAccum += rate×0.01 每 tick）
     max_active = avg0(e, "spawn_max_active")
     rate = avg0(e, "spawn_rate")
-    if max_active > 0:
+    max_launched = avg0(e, "spawn_max_launched")
+    sys_dur = avg0(e, "system_duration") * 0.01
+    one_shot = sys_dur > 0 and not (flags & FLAG_SYSTEM_LOOPS)
+    if one_shot:
+        # 一次性系统：总量 = 速率×系统时长（受 max_launched/max_active 约束）；
+        # 发射在系统时长内均匀进行 → explosiveness 控制发射期占 lifetime 的比例
+        total = rate * sys_dur if rate > 0 else (max_active if max_active > 0 else 8.0)
+        if max_launched > 0:
+            total = min(total, max_launched)
+        if max_active > 0:
+            total = min(total, max_active)
+        amount = max(1, int(round(total)))
+    elif max_active > 0:
         amount = int(round(max_active))
     else:
         amount = int(math.ceil(rate * dur_s)) if rate > 0 else 8
-    max_launched = avg0(e, "spawn_max_launched")
-    if max_launched > 0:
-        amount = min(amount, int(round(max_launched)))
+        if max_launched > 0:
+            amount = min(amount, int(round(max_launched)))
     amount = max(1, min(amount, 512))
 
-    sys_dur = avg0(e, "system_duration") * 0.01
-    one_shot = sys_dur > 0 and not (flags & FLAG_SYSTEM_LOOPS)
-
     lines.append(f'[node name="{node_name}" type="GPUParticles2D" parent="."]')
-    ox, oy = avg0(e, "emitter_offset_x"), avg0(e, "emitter_offset_y")
+    ox = avg0(e, "emitter_offset_x") + box_cx
+    oy = avg0(e, "emitter_offset_y") + box_cy
     if ox or oy:
         lines.append(f"position = Vector2({fnum(ox)}, {fnum(oy)})")
     lines.append(f"amount = {amount}")
@@ -435,6 +494,8 @@ def build_emitter_tscn(
         lines.append(f"lifetime_randomness = {fnum(min(1.0, (dur_hi - dur_lo) / 2 * 0.01 / dur_s))}")
     if one_shot:
         lines.append("one_shot = true")
+        # explosiveness=0 → 均匀分布在整个 lifetime；发射期 = sys_dur → 1 - sys_dur/lifetime
+        lines.append(f"explosiveness = {fnum(max(0.0, min(1.0, 1.0 - sys_dur / dur_s)))}")
     if flags & FLAG_DONT_FOLLOW:
         lines.append("local_coords = false")
     lines.append(f'process_material = SubResource("{pm_id}")')
